@@ -1,3 +1,4 @@
+{-# LANGUAGE OverloadedStrings #-}
 -- | Deeplink's main module.
 --
 -- Wraps the DeepLink with optparse based option parsing and invokes
@@ -5,7 +6,8 @@
 {-# LANGUAGE CPP #-}
 module Main (main) where
 
-import           Control.Monad (liftM, when)
+import           Control.Monad (liftM, when, forM_)
+import           Data.Maybe (fromMaybe)
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BS8
 import qualified DeepLink
@@ -13,13 +15,15 @@ import           Options.Applicative
 import           System.FilePath.ByteString (FilePath)
 import qualified System.Posix.ByteString as Posix
 import           System.Process (callProcess)
-
+import           System.IO (withFile, IOMode(..))
 import           Prelude.Compat hiding (FilePath)
 
 data Opts = Opts
   { _ldCommand :: String
   , _oPaths :: [FilePath]
   , _verbose :: Bool
+  , _dryRun :: Bool
+  , _generateDot :: Maybe FilePath
   } deriving Show
 
 #ifdef OPTPARSE_OLD_VERSION
@@ -54,14 +58,27 @@ getOpts =
            metavar "ld-command")
       <*> some (argument bytestr (metavar "opaths" <> help "At least one root .o path"))
       <*> switch (long "verbose" <> short 'v' <> help "Verbose mode")
+      <*> switch (long "dry-run" <> short 'd' <> help "Dry run (won't execute the command)")
+      <*> optional (option bytestr (metavar "DOTFILE" <> long "graph" <> short 'g' <> help "Generate dependency graph (in GraphViz dot format)"))
+
+-- TODO: add escaping, etc.
+quote :: ByteString -> ByteString
+quote x = "\"" <> x <> "\""
 
 main :: IO ()
 main = do
   -- setNumCapabilities . (*2) =<< getNumProcessors -- To get full reasonable buildsome parallelism
-  Opts ldCommand oPaths verbose <- getOpts
+  Opts ldCommand oPaths verbose dryRun genDot <- getOpts
   cwd <- Posix.getWorkingDirectory
-  fullList <- DeepLink.deepLink cwd oPaths
+  (dependencies, fullList) <- DeepLink.deepLink cwd oPaths
   let cmd@(cmdExec:cmdArgs) = words ldCommand ++ map BS8.unpack fullList
   when verbose $ putStrLn $ unwords cmd
-  callProcess cmdExec cmdArgs
+  when (not dryRun) $ callProcess cmdExec cmdArgs
+  case genDot of
+      Nothing -> return ()
+      Just dotFilePath -> do
+          withFile (BS8.unpack dotFilePath) WriteMode $ \handle -> do
+              BS8.hPutStrLn handle "digraph G {"
+              forM_ dependencies $ \(parent, child) -> BS8.hPutStrLn handle $ "\t" <> quote (fromMaybe "commandline" parent) <> " -> " <> quote child
+              BS8.hPutStrLn handle "}"
   return ()

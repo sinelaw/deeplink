@@ -1,4 +1,4 @@
-{-# LANGUAGE DeriveDataTypeable, OverloadedStrings #-}
+{-# LANGUAGE DeriveDataTypeable, OverloadedStrings, TupleSections #-}
 module DeepLink
     ( deepLink
     , readPrunes
@@ -95,13 +95,15 @@ getOrder filePath
     | ".a" `BS8.isSuffixOf` filePath = Lib
     | otherwise = File
 
-deepLink :: FilePath -> [ByteString] -> IO [FilePath]
+deepLink :: FilePath -> [ByteString] -> IO ([(Maybe FilePath, FilePath)], [FilePath])
 deepLink cwd args =
     do
         alreadyAdded <- newMVar OSet.empty
         requestedPrunes <- newMVar OSet.empty
         actuallyPruned <- newMVar OSet.empty
-        let addPruneList arg =
+        dependencies <- newMVar OSet.empty
+        let addPruneList :: FilePath -> IO ()
+            addPruneList arg =
                 do
                     let oPathRelative = FilePath.canonicalizePathAsRelative cwd arg
                     -- if the mvar is used concurrenty, this is a race (they are not nested)
@@ -118,11 +120,13 @@ deepLink cwd args =
         let addLinkCmds oPathRelative =
                 do
                     readPrunes oPathRelative >>= mapM_ addPruneList
-                    readDeps   oPathRelative >>= mapM_ addDep
-            addDep arg
+                    readDeps   oPathRelative >>= mapM_ (addDep $ Just oPathRelative)
+            addDep :: Maybe FilePath -> FilePath -> IO ()
+            addDep parent arg
                 | File /= getOrder arg =
-                  tryPrune arg $
-                  modifyMVar_ alreadyAdded $ return . OSet.tryAppend arg
+                  tryPrune arg $ do
+                      modifyMVar_ alreadyAdded $ return . OSet.tryAppend arg
+                      modifyMVar_ dependencies $ return . OSet.tryAppend (parent, arg)
                 | otherwise = addDepFile (FilePath.canonicalizePathAsRelative cwd arg)
             addDepFile oPathRelative =
                 tryPrune oPathRelative $
@@ -134,12 +138,14 @@ deepLink cwd args =
                             Just newSet -> (newSet, False)
                     alreadyMember <- modifyMVar alreadyAdded add
                     unless alreadyMember $ addLinkCmds oPathRelative
-        mapM_ addDep args
+        mapM_ (addDep Nothing) args
         actuallyPrunedSet <- OSet.toSet <$> readMVar actuallyPruned
         requestedPrunedSet <- OSet.toSet <$> readMVar requestedPrunes
         let redundantPrunes = requestedPrunedSet `Set.difference` actuallyPrunedSet
         unless (Set.null redundantPrunes) $ E.throwIO (RedundantPrunes redundantPrunes)
-        sortOn getOrder . OSet.toList <$> readMVar alreadyAdded
+        deps <- sortOn (getOrder . snd) . OSet.toList <$> readMVar dependencies
+        uniqueOFiles <- sortOn getOrder . OSet.toList <$> readMVar alreadyAdded
+        return (deps, uniqueOFiles)
 
 sortOn :: Ord b => (a -> b) -> [a] -> [a]
 sortOn = sortBy . comparing
